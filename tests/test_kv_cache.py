@@ -161,8 +161,8 @@ class PagedKVCache:
 
     def _evict_lru_to_cxl(self) -> Optional[int]:
         """Evict least recently used block to CXL"""
-        # Simple LRU: evict first used block found
-        for seq_id, blocks in self.seq_to_blocks.items():
+        # Simple LRU: evict first used block found from any sequence
+        for seq_id, blocks in list(self.seq_to_blocks.items()):
             if blocks:
                 block_id = blocks[0]
                 if block_id in self.gpu_blocks:
@@ -173,12 +173,22 @@ class PagedKVCache:
                         del self.gpu_blocks[block_id]
                         self.stats['offloads'] += 1
 
-                        # Create new GPU block
+                        # Reuse the block ID but create new GPU block
                         new_block = KVCacheBlock(self.config, self.block_size)
                         new_block.allocate_gpu(self.device)
-                        new_block_id = max(self.gpu_blocks.keys()) + 1 if self.gpu_blocks else 0
+                        new_block_id = max(list(self.gpu_blocks.keys()) + list(self.cxl_blocks.keys())) + 1
                         self.gpu_blocks[new_block_id] = new_block
                         return new_block_id
+
+        # If no GPU blocks to evict, try to reuse a free CXL block
+        if self.free_cxl_blocks:
+            cxl_id = self.free_cxl_blocks.pop(0)
+            new_block = KVCacheBlock(self.config, self.block_size)
+            new_block.allocate_gpu(self.device)
+            new_block_id = max(list(self.gpu_blocks.keys()) + [0]) + 1
+            self.gpu_blocks[new_block_id] = new_block
+            return new_block_id
+
         return None
 
     def get_block(self, block_id: int) -> torch.Tensor:
@@ -269,9 +279,10 @@ def simulate_llm_inference():
             print(f"  Sequence {seq_id}: {e}")
 
         # Simulate accessing some blocks (like attention)
-        if seq_id > 0 and seq_id % 10 == 0:
+        if seq_id > 0 and seq_id % 10 == 0 and active_sequences:
             # Access random previous sequence
-            access_seq = active_sequences[seq_id // 2] if active_sequences else 0
+            access_idx = min(len(active_sequences) - 1, seq_id // 4)
+            access_seq = active_sequences[access_idx]
             if access_seq in cache.seq_to_blocks:
                 for block_id in cache.seq_to_blocks[access_seq][:2]:
                     try:
