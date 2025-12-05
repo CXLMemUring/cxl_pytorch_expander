@@ -16,6 +16,14 @@
 #include <vector>
 #include <map>
 #include <errno.h>
+#include <time.h>  // For clock_gettime (nanosecond precision)
+
+// High-resolution wall time helper
+static inline uint64_t get_wall_time_ns() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
 
 // NVIDIA RM ioctl definitions (matching nvos.h)
 #define NV_IOCTL_MAGIC      'F'
@@ -521,6 +529,48 @@ static PyObject* cxl_gpu_to_cxl(PyObject* self, PyObject* args) {
     return Py_BuildValue("I", params.transferId);
 }
 
+// GPU to CXL transfer with wall time measurement (returns transferId, latency_ns)
+static PyObject* cxl_gpu_to_cxl_timed(PyObject* self, PyObject* args) {
+    unsigned long long bufferId, gpuOffset, cxlOffset, size;
+    if (!PyArg_ParseTuple(args, "KKKK", &bufferId, &gpuOffset, &cxlOffset, &size)) {
+        return NULL;
+    }
+
+    if (!g_ctx.initialized) {
+        PyErr_SetString(PyExc_RuntimeError, "Not initialized");
+        return NULL;
+    }
+
+    auto it = g_buffers.find(bufferId);
+    if (it == g_buffers.end()) {
+        PyErr_SetString(PyExc_ValueError, "Invalid buffer ID");
+        return NULL;
+    }
+
+    NV2080_CTRL_CMD_BUS_CXL_P2P_DMA_REQUEST_PARAMS params;
+    memset(&params, 0, sizeof(params));
+    params.cxlBufferHandle = it->second.driverHandle;
+    params.gpuOffset = gpuOffset;
+    params.cxlOffset = cxlOffset;
+    params.size = size;
+    params.flags = CXL_P2P_DMA_FLAG_GPU_TO_CXL;
+
+    // Measure wall time around the ioctl call
+    uint64_t start_ns = get_wall_time_ns();
+    int ret = rm_control(g_ctx.hSubdevice, NV2080_CTRL_CMD_BUS_CXL_P2P_DMA_REQUEST,
+                        &params, sizeof(params));
+    uint64_t end_ns = get_wall_time_ns();
+    uint64_t latency_ns = end_ns - start_ns;
+
+    if (ret != 0) {
+        PyErr_Format(PyExc_RuntimeError, "DMA transfer failed: 0x%x", ret);
+        return NULL;
+    }
+
+    // Return (transferId, latency_ns)
+    return Py_BuildValue("(IK)", params.transferId, latency_ns);
+}
+
 // CXL to GPU transfer
 static PyObject* cxl_cxl_to_gpu(PyObject* self, PyObject* args) {
     unsigned long long bufferId, gpuOffset, cxlOffset, size;
@@ -555,6 +605,64 @@ static PyObject* cxl_cxl_to_gpu(PyObject* self, PyObject* args) {
     }
 
     return Py_BuildValue("I", params.transferId);
+}
+
+// CXL to GPU transfer with wall time measurement (returns transferId, latency_ns)
+static PyObject* cxl_cxl_to_gpu_timed(PyObject* self, PyObject* args) {
+    unsigned long long bufferId, gpuOffset, cxlOffset, size;
+    if (!PyArg_ParseTuple(args, "KKKK", &bufferId, &gpuOffset, &cxlOffset, &size)) {
+        return NULL;
+    }
+
+    if (!g_ctx.initialized) {
+        PyErr_SetString(PyExc_RuntimeError, "Not initialized");
+        return NULL;
+    }
+
+    auto it = g_buffers.find(bufferId);
+    if (it == g_buffers.end()) {
+        PyErr_SetString(PyExc_ValueError, "Invalid buffer ID");
+        return NULL;
+    }
+
+    NV2080_CTRL_CMD_BUS_CXL_P2P_DMA_REQUEST_PARAMS params;
+    memset(&params, 0, sizeof(params));
+    params.cxlBufferHandle = it->second.driverHandle;
+    params.gpuOffset = gpuOffset;
+    params.cxlOffset = cxlOffset;
+    params.size = size;
+    params.flags = CXL_P2P_DMA_FLAG_CXL_TO_GPU;
+
+    // Measure wall time around the ioctl call
+    uint64_t start_ns = get_wall_time_ns();
+    int ret = rm_control(g_ctx.hSubdevice, NV2080_CTRL_CMD_BUS_CXL_P2P_DMA_REQUEST,
+                        &params, sizeof(params));
+    uint64_t end_ns = get_wall_time_ns();
+    uint64_t latency_ns = end_ns - start_ns;
+
+    if (ret != 0) {
+        PyErr_Format(PyExc_RuntimeError, "DMA transfer failed: 0x%x", ret);
+        return NULL;
+    }
+
+    // Return (transferId, latency_ns)
+    return Py_BuildValue("(IK)", params.transferId, latency_ns);
+}
+
+// Direct memory copy with timing (for CUDA-mapped path)
+// Copies from src_ptr to dst_ptr and returns latency in nanoseconds
+static PyObject* cxl_memcpy_timed(PyObject* self, PyObject* args) {
+    unsigned long long dst_ptr, src_ptr, size;
+    if (!PyArg_ParseTuple(args, "KKK", &dst_ptr, &src_ptr, &size)) {
+        return NULL;
+    }
+
+    uint64_t start_ns = get_wall_time_ns();
+    memcpy((void*)dst_ptr, (void*)src_ptr, size);
+    uint64_t end_ns = get_wall_time_ns();
+    uint64_t latency_ns = end_ns - start_ns;
+
+    return Py_BuildValue("K", latency_ns);
 }
 
 // Cleanup
@@ -612,6 +720,9 @@ static PyMethodDef CXLMethods[] = {
     {"get_buffer_size", cxl_get_buffer_size, METH_VARARGS, "Get buffer size"},
     {"gpu_to_cxl", cxl_gpu_to_cxl, METH_VARARGS, "Transfer GPU to CXL"},
     {"cxl_to_gpu", cxl_cxl_to_gpu, METH_VARARGS, "Transfer CXL to GPU"},
+    {"gpu_to_cxl_timed", cxl_gpu_to_cxl_timed, METH_VARARGS, "Transfer GPU to CXL with wall time measurement (returns transferId, latency_ns)"},
+    {"cxl_to_gpu_timed", cxl_cxl_to_gpu_timed, METH_VARARGS, "Transfer CXL to GPU with wall time measurement (returns transferId, latency_ns)"},
+    {"memcpy_timed", cxl_memcpy_timed, METH_VARARGS, "Timed memory copy (returns latency_ns)"},
     {"cleanup", cxl_cleanup, METH_NOARGS, "Cleanup CXL resources"},
     {NULL, NULL, 0, NULL}
 };
